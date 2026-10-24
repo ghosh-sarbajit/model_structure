@@ -477,8 +477,9 @@ def wiring_lines(f):
              (r"b", r"a + " + N + r"_{\mathrm{pf}}\big(\op{FFN}(" + N + r"_{\mathrm{pre}}(a))\big)", "norm before AND after the MLP")]
         last = "b"
         if f["ple"]:
-            L.append((r"c", r"b + \op{RMSNorm}_{\mathrm{ple}}\big(W_{\mathrm{proj}}(" + f["act"] + r"(W_{\mathrm{gate}}\,b)\odot p_\ell)\big)",
-                      f"inject this layer's {f['ple_dim']}-dim per-layer embedding $p_\\ell$"))
+            L.append((r"c", r"b + \op{PLE}_\ell(b)", f"inject this layer's {f['ple_dim']}-dim per-layer embedding $p_\\ell$"))
+            L.append((r"\op{PLE}_\ell(u)", r"\op{RMSNorm}_{\mathrm{ple}}\big(W^{\mathrm{ple}}_{\mathrm{proj}}(" + f["act"] +
+                      r"(W^{\mathrm{ple}}_{\mathrm{gate}}\,u)\odot p_\ell)\big)", ""))
             last = "c"
         if f["layer_scalar"]:
             L.append((r"\mathcal{B}(h)", r"\gamma_\ell\cdot " + last, "fixed per-layer scalar"))
@@ -575,7 +576,7 @@ def block_algorithm(f, code, name, d_sym):
         st(r"h \gets r + m", "add residual")
     if f["ple"]:
         sub("per-layer embedding injection")
-        st(r"h \gets h + \op{RMSNorm}\big((" + f["act"] + r"(h W_{\mathrm{gate}}^{\top}) \odot p_\ell) W_{\mathrm{proj}}^{\top}\big)",
+        st(r"h \gets h + \op{RMSNorm}\big((" + f["act"] + r"(h W^{\mathrm{ple}\top}_{\mathrm{gate}}) \odot p_\ell) W^{\mathrm{ple}\top}_{\mathrm{proj}}\big)",
            f"gate down to {f['ple_dim']}, multiply by $p_\\ell$, project back up")
     if f["layer_scalar"]:
         st(r"h \gets \gamma_\ell\, h", "fixed per-layer scale")
@@ -804,7 +805,7 @@ PREAMBLE = r"""\documentclass[10pt,a4paper]{article}
 \usepackage{booktabs}
 \usepackage{longtable}
 \usepackage{array}
-\usepackage{amsmath,amssymb}
+\usepackage{amsmath,amssymb,amsthm}
 \usepackage{algorithm}
 \usepackage{algpseudocode}
 \usepackage{xcolor}
@@ -814,6 +815,8 @@ PREAMBLE = r"""\documentclass[10pt,a4paper]{article}
 \algrenewcommand\algorithmiccomment[1]{\hfill{\color{gray!70!black}\footnotesize$\triangleright$ #1}}
 \setlength{\LTpre}{4pt}\setlength{\LTpost}{4pt}
 \allowdisplaybreaks
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
 """
 
 
@@ -867,6 +870,533 @@ def hyper_rows(config):
 
 def arch_signature(cls, recs):
     return cls, [(r["path"], tuple(r["shape"]), r["dtype"], r["tied_to"]) for r in recs]
+
+
+# ---------------------------------------------------------------------------
+# Mathematical representation (top-down formal treatment)
+# ---------------------------------------------------------------------------
+
+# Weight name suffix -> math symbol. First match wins, so specific names come first.
+WSYM = [
+    (("linear_attn.in_proj_qkv.weight", "attn.qkv.weight"), r"W_{qkv}"),
+    (("in_proj_z.weight",), r"W_z"), (("in_proj_a.weight",), r"W_a"), (("in_proj_b.weight",), r"W_b"),
+    (("linear_attn.out_proj.weight",), r"W_{\mathrm{out}}"),
+    (("linear_attn.conv1d.weight",), r"K_{\mathrm{conv}}"),
+    (("relative_k_proj.weight",), r"W_{\mathrm{rel}}"),
+    (("q_proj.weight", "q_proj.linear.weight"), r"W_Q"),
+    (("k_proj.weight", "k_proj.linear.weight"), r"W_K"),
+    (("v_proj.weight", "v_proj.linear.weight"), r"W_V"),
+    (("o_proj.weight", "o_proj.linear.weight", "attn.proj.weight", "self_attn.post.linear.weight",
+      "self_attn.out_proj.weight"), r"W_O"),
+    (("mlp.gate_proj.weight", "mlp.gate_proj.linear.weight"), r"W_{\mathrm{gate}}"),
+    (("mlp.up_proj.weight", "mlp.up_proj.linear.weight"), r"W_{\mathrm{up}}"),
+    (("mlp.down_proj.weight", "mlp.down_proj.linear.weight"), r"W_{\mathrm{down}}"),
+    (("mlp.fc1.weight", "mlp.linear_fc1.weight"), r"W_1"), (("mlp.fc2.weight", "mlp.linear_fc2.weight"), r"W_2"),
+    (("mlp.router.weight",), r"W_r"),
+    (("experts.gate_up_proj",), r"W^{gu}_e"), (("experts.down_proj",), r"W^{d}_e"),
+    (("per_layer_input_gate.weight",), r"W^{\mathrm{ple}}_{\mathrm{gate}}"),
+    (("per_layer_projection.weight",), r"W^{\mathrm{ple}}_{\mathrm{proj}}"),
+    (("feed_forward1.ffw_layer_1.linear.weight",), r"W_1^{[1]}"), (("feed_forward1.ffw_layer_2.linear.weight",), r"W_2^{[1]}"),
+    (("feed_forward2.ffw_layer_1.linear.weight",), r"W_1^{[2]}"), (("feed_forward2.ffw_layer_2.linear.weight",), r"W_2^{[2]}"),
+    (("lconv1d.linear_start.linear.weight",), r"W_{\mathrm{start}}"),
+    (("lconv1d.linear_end.linear.weight",), r"W_{\mathrm{end}}"),
+    (("lconv1d.depthwise_conv1d.weight",), r"K_{\mathrm{dw}}"),
+]
+
+
+def mnum(n):
+    """Integer for math mode (thousands separators without extra space)."""
+    return fmt(n).replace(",", "{,}")
+
+
+def block_params(b):
+    """Matrices of one block with their math symbols and shapes (out x in), plus the leftover count."""
+    out, used = [], 0
+    for r in b["recs"]:
+        sym = next((s for sufs, s in WSYM if any(r["rel"].endswith(x) for x in sufs)), None)
+        if sym is None:
+            continue
+        shp = list(r["shape"])
+        if r["rel"].startswith("mlp.experts.") or ".experts." in r["rel"]:
+            txt = sym + r"\in\mathbb{R}^{" + str(shp[2]) + r"\times" + str(shp[1]) + r"},\ e=1..{" + str(shp[0]) + "}"
+        else:
+            txt = sym + r"\in\mathbb{R}^{" + r"\times".join(str(x) for x in shp) + "}"
+        out.append(txt)
+        used += r["numel"]
+    return out, b["params"] - used
+
+
+def block_composition(f):
+    """The block as a composition of residual sub-layers (id + g)."""
+    I = r"\mathrm{id}"
+    N = r"\op{LN}" if f["ln"] else r"\op{RMSNorm}"
+    M = r"\op{Mixer}" if f["mixer"] == "gdn" else r"\op{Attn}"
+    if f["conformer"]:
+        g = [r"\tfrac12\op{FFN}_1", r"\op{RMSNorm}_{\mathrm{post}}\circ\op{Attn}_{rel}\circ\op{RMSNorm}_{\mathrm{pre}}",
+             r"\op{Conv}", r"\tfrac12\op{FFN}_2"]
+        return (r"\op{RMSNorm}_{\mathrm{out}}\circ" + r"\circ".join(f"({I}+{x})" for x in reversed(g))), g, ""
+    if f["sandwich"]:
+        g = [N + r"_{\mathrm{pa}}\circ " + M + r"\circ " + N + r"_{\mathrm{in}}",
+             N + r"_{\mathrm{pf}}\circ\op{FFN}\circ " + N + r"_{\mathrm{pre}}"]
+    else:
+        g = [M + r"\circ " + N + r"_{1}", r"\op{FFN}\circ " + N + r"_{2}"]
+    if f["ple"]:
+        g.append(r"\op{PLE}_\ell")
+    s = r"\circ".join(f"({I}+{x})" for x in reversed(g))
+    scale = r"\gamma_\ell" if f["layer_scalar"] else ""
+    if scale:
+        s = scale + r"\cdot\big(" + s + r"\big)"
+    return s, g, scale
+
+
+def pattern_str(groups):
+    """Layer-type sequence left to right, e.g. (S^4 F)^7."""
+    parts = []
+    for unit, k, _ in groups:
+        u = r"\,".join(r"\mathrm{" + c + "}" + (f"^{{{r}}}" if r > 1 else "") for c, r in runs(unit))
+        if k > 1:
+            if len(runs(unit)) == 1 and runs(unit)[0][1] > 1:
+                c, r = runs(unit)[0]
+                u = r"\mathrm{" + c + "}" + f"^{{{r * k}}}"
+            else:
+                u = (r"(" + u + ")" if len(runs(unit)) > 1 else u) + f"^{{{k}}}"
+        parts.append(u)
+    return r"\,".join(parts)
+
+
+def valset(vals):
+    vals = sorted({v for v in vals if v is not None})
+    if not vals:
+        return None
+    return str(vals[0]) if len(vals) == 1 else r"\{" + ",".join(str(v) for v in vals) + r"\}"
+
+
+def BL(code, l):
+    return r"\mathcal{B}^{(" + str(l) + r")}_{\mathrm{" + code + "}}"
+
+
+def math_section(name_tex, stacks, text_stack, towers, d, V, tied, softcap, has_ple, gemma_scale, total):
+    tex = []
+    L = text_stack["n"]
+    codes = text_stack["codes"]
+    tblocks = text_stack["blocks"]
+    Vs = mnum(V) if isinstance(V, int) else V
+    f0 = tblocks[0]["f"]
+    ple_arg = r",\,p_\ell" if has_ple else ""
+
+    tex.append(r"\section{Mathematical Representation}\label{sec:func}")
+    tex.append(r"We describe the model \emph{top-down}. First the whole network is written as one composition of "
+               r"functions (Section~\ref{sec:comp}). Then every function that appears in that composition is defined "
+               r"(Section~\ref{sec:layers}), down to individual neurons and attention heads. The remaining subsections "
+               r"describe the parameters, the outputs, the intermediate states, and the local linear behaviour.")
+
+    # 2.1 composition -------------------------------------------------------------
+    tex.append(r"\subsection{The model as a composition of layers}\label{sec:comp}")
+    first = L if L <= 6 else max(3, min(len(text_stack["groups"][0][0]) if text_stack["groups"][0][1] > 1 else 4, 6))
+    if L <= 6:
+        seq = [BL(codes[l - 1], l) for l in range(L, 0, -1)]
+    else:
+        seq = [BL(codes[L - 1], L), r"\cdots"] + [BL(codes[l - 1], l) for l in range(first, 0, -1)]
+    inp = r"E_{\mathrm{mm}}" if towers else r"E"
+    tex.append(r"\begin{definition}[" + name_tex + r" as an $L$-layer decoder]")
+    tex.append(r"The model is a function $f_\theta:\mathcal{X}\to\mathcal{Y}$ with parameters $\theta$. It maps a "
+               r"sequence of $T$ token ids $x\in\mathcal{X}=\{1,\dots,V\}^{T}$ to one logit vector per position, "
+               r"$y\in\mathcal{Y}=\mathbb{R}^{T\times V}$ ($V=" + Vs + r"$). It is a composition of an embedding $" + inp +
+               r"$, $L=" + str(L) + r"$ decoder blocks $\mathcal{B}^{(\ell)}$ and an output head $\Psi$:")
+    tex.append(r"\begin{equation}")
+    tex.append(r"  f_\theta \;=\; \Psi\circ\mathcal{B}^{(L)}\circ\mathcal{B}^{(L-1)}\circ\cdots\circ\mathcal{B}^{(2)}\circ\mathcal{B}^{(1)}\circ " + inp)
+    tex.append(r"\end{equation}")
+    tex.append(r"Every block maps $\mathbb{R}^{T\times d}\to\mathbb{R}^{T\times d}$ ($d=" + str(d) + r"$), so the blocks "
+               r"can be stacked in any number. Block $\ell$ has its own parameters $\theta_\ell$ and is stored in the "
+               r"checkpoint as \texttt{" + esc(text_stack["path"]) + r".}$(\ell-1)$." +
+               (r" Each block also receives its own per-layer embedding $p_\ell$ (Definition~\ref{def:embed})." if has_ple else ""))
+    tex.append(r"\end{definition}")
+
+    ntypes = len(tblocks)
+    tex.append(r"\begin{definition}[Block types]")
+    if ntypes == 1:
+        tex.append(r"All $L$ blocks have the same functional form $\mathcal{B}_{\mathrm{" + tblocks[0]["code"] + r"}}$ "
+                   r"(" + esc(tblocks[0]["name"]) + r"). They differ only in their weights: "
+                   r"$\mathcal{B}^{(\ell)}=\mathcal{B}_{\mathrm{" + tblocks[0]["code"] + r"}}(\,\cdot\,;\theta_\ell)$.")
+    else:
+        tex.append(r"There are " + str(ntypes) + r" block types (same function form within a type, different weights). "
+                   r"A type map $c:\{1,\dots,L\}\to\{" + ",".join(r"\mathrm{" + b["code"] + "}" for b in tblocks) +
+                   r"\}$ says which type layer $\ell$ is: $\mathcal{B}^{(\ell)}=\mathcal{B}_{c(\ell)}(\,\cdot\,;\theta_\ell)$. "
+                   r"Here $c=(" + pattern_str(text_stack["groups"]) + r")$, read left to right from layer 1.")
+    tex.append(r"Written out, with the type as a subscript:")
+    tex.append(r"\begin{equation}")
+    tex.append(r"  f_\theta = \Psi\circ " + r"\circ ".join(seq) + r"\circ " + inp)
+    tex.append(r"\end{equation}")
+    tex.append(r"Grouping the repetitions with composition powers ($\mathcal{B}^{\circ n}$ = $n$ consecutive blocks of the "
+               r"same type, each with its own weights) gives the compact form")
+    tex.append(r"\begin{equation}\label{eq:compact}")
+    tex.append(r"  f_\theta = \Psi\circ\Big(" + stack_expr(text_stack["groups"]) + r"\Big)\circ " + inp)
+    tex.append(r"\end{equation}")
+    tex.append(r"\end{definition}")
+
+    for s in towers:
+        enc = "Enc_V" if s["role"] == "vision" else "Enc_A"
+        pre = "PatchEmbed" if s["role"] == "vision" else "Subsample"
+        what = "image patches" if s["role"] == "vision" else "audio frames"
+        dt = cget(s["cfg"], "hidden_size", "?")
+        tex.append(r"\begin{definition}[" + ROLE_TITLE[s["role"]] + r"]")
+        tex.append(r"The " + ROLE_TITLE[s["role"]].lower() + r" is itself a composition of $" + str(s["n"]) +
+                   r"$ blocks acting on a sequence of " + what + r" of width $" + str(dt) + r"$:")
+        tex.append(r"\begin{equation}")
+        tex.append(r"  \op{" + enc + r"} = \op{Post}\circ " + stack_expr(s["groups"]) + r"\circ\op{" + pre + "}")
+        tex.append(r"\end{equation}")
+        tex.append(r"$\op{" + pre + r"}$ turns the raw input into vectors and $\op{Post}$ is the final norm / pooling / "
+                   r"merging (Table~\ref{tab:nonrep}).")
+        tex.append(r"\end{definition}")
+
+    tex.append(r"\paragraph{Layer pattern.}")
+    rows = []
+    for s in stacks:
+        for b in s["blocks"]:
+            rows.append(f"${B(b['code'])}$ & {esc(b['name'])} & {len(b['layers'])} & {fmt(b['params'])} & "
+                        f"{ranges_text(b['layers'])}")
+    tex += table(r"l>{\raggedright\arraybackslash}p{5.6cm}rr>{\raggedright\arraybackslash}p{4.4cm}",
+                 r"Symbol & Block type & Count & Params / block & Checkpoint indices", rows)
+    for s in stacks:
+        tex.append(r"\paragraph{" + ROLE_TITLE[s["role"]] + f" ({s['n']} layers).}} ")
+        parts = []
+        for unit, k, start in s["groups"]:
+            u = ", ".join(f"${B(c)}$" + (f"$\\times{r}$" if r > 1 else "") for c, r in runs(unit))
+            parts.append(f"layers {start}--{start + len(unit) * k - 1}: [{u}] repeated {k}$\\times$"
+                         if k > 1 else f"layers {start}--{start + len(unit) - 1}: [{u}]")
+        tex.append("; ".join(parts) + " (checkpoint indices, i.e.\\ $\\ell-1$).")
+
+    # 2.2 the layers --------------------------------------------------------------
+    tex.append(r"\subsection{The layers, top to bottom}\label{sec:layers}")
+    tex.append(r"Every function in the composition above is defined here. Only the attention (or linear-attention) "
+               r"sub-layer mixes information \emph{between} positions $t$. Every other sub-layer (norms, feed-forward "
+               r"networks, projections) acts on each token vector $h_t\in\mathbb{R}^{d}$ independently, e.g.\ "
+               r"$\op{FFN}(h)_t=\op{FFN}(h_t)$. All weights follow the convention $W\in\mathbb{R}^{d_{\mathrm{out}}\times d_{\mathrm{in}}}$, "
+               r"so a projection of a token vector is $W u$ (as in an affine layer $f_i(u)=A^{(i)}u+b^{(i)}$).")
+
+    tex.append(r"\begin{definition}[Token embedding]\label{def:embed}")
+    tex.append(r"$E:\{1,\dots,V\}^{T}\to\mathbb{R}^{T\times d}$ looks up one row of the embedding matrix "
+               r"$W_E\in\mathbb{R}^{V\times d}$ per token:")
+    tex.append(r"\begin{equation}")
+    tex.append(r"  E(x)_t = W_E[x_t,:]" + (r"\cdot\sqrt{d}" if gemma_scale else "") + r",\qquad t=1,\dots,T.")
+    tex.append(r"\end{equation}")
+    if towers:
+        merge = [r"E(x)"]
+        for s in towers:
+            tag = "img" if s["role"] == "vision" else "aud"
+            enc = "Enc_V" if s["role"] == "vision" else "Enc_A"
+            merge.append(r"\op{Proj}_{\mathrm{" + tag + r"}}\big(\op{" + enc + r"}(\mathrm{" + tag + r"})\big)")
+        tex.append(r"With images" + (r" or audio" if any(s["role"] == "audio" for s in towers) else "") +
+                   r", the multimodal embedding replaces the placeholder-token rows of $E(x)$ by projected encoder outputs:")
+        tex.append(r"\begin{equation}")
+        tex.append(r"  E_{\mathrm{mm}}(x,\cdot) = \op{Merge}\Big(" + r",\ ".join(merge) + r"\Big).")
+        tex.append(r"\end{equation}")
+    if has_ple:
+        tex.append(r"Per-layer embeddings (PLE): a second table gives every token one small vector for each layer,")
+        tex.append(r"\begin{equation}")
+        tex.append(r"  p = \tfrac{1}{\sqrt2}\Big(\op{Embed}_{\mathrm{PLE}}(x) + \op{RMSNorm}\big(W_{\mathrm{ple}}\,E(x)/\sqrt{d}\big)\Big),"
+                   r"\qquad p=(p_1,\dots,p_L),\ p_\ell\in\mathbb{R}^{T\times " + str(f0["ple_dim"]) + r"}.")
+        tex.append(r"\end{equation}")
+    tex.append(r"\end{definition}")
+
+    N_def = (r"$\op{RMSNorm}(u)=\gamma\odot u/\sqrt{\tfrac1d\sum_i u_i^2+\epsilon}$, with a learned scale $\gamma\in\mathbb{R}^{d}$")
+    tex.append(r"\begin{definition}[Normalisation]")
+    tex.append(N_def + r", applied to each token vector separately. It fixes the scale of a vector without changing its "
+               r"direction. Every norm in the model has its own $\gamma$, distinguished by a subscript "
+               r"(e.g.\ $\op{RMSNorm}_1$, $\op{RMSNorm}_{\mathrm{final}}$)." +
+               (r" $\op{LN}$ (LayerNorm, used in some encoder blocks) additionally subtracts the mean and adds a bias." 
+                if any(b["f"]["ln"] for s in stacks for b in s["blocks"]) else ""))
+    tex.append(r"\end{definition}")
+
+    for s in stacks:
+        for b in s["blocks"]:
+            f = b["f"]
+            comp, g, scale = block_composition(f)
+            tex.append(r"\begin{definition}[Block $" + B(b["code"]) + r"$: " + esc(b["name"]) + r"]")
+            where = {"text": "decoder", "vision": "vision-encoder", "audio": "audio-encoder"}.get(s["role"], "")
+            tex.append(r"A " + where + r" block of this type maps $h\in\mathbb{R}^{T\times " + str(f["d"]) + r"}$ to the same "
+                       r"space. It is a composition of " + str(len(g)) + r" residual sub-layers, each of the form "
+                       r"$(\mathrm{id}+g)(h)=h+g(h)$" + (r", followed by a final norm" if f["conformer"] else "") +
+                       (r", scaled by the fixed per-layer scalar $\gamma_\ell$" if scale else "") + ":")
+            tex.append(r"\begin{equation}")
+            tex.append(r"  " + B(b["code"]) + r" = " + comp)
+            tex.append(r"\end{equation}")
+            tex.append(r"Step by step, the sub-layers are:")
+            lines = wiring_lines(f)
+            if not f["conformer"]:
+                lines += mixer_lines(f) + ffn_lines(f)
+            tex += align(lines)
+            ps, rest = block_params(b)
+            tex.append(r"Parameters of one block ($|\theta_\ell|=" + mnum(b["params"]) + r"$): " +
+                       ", ".join(f"${p}$" for p in ps) +
+                       (f", plus {fmt(rest)} parameters in norm scales, biases and other vectors" if rest > 0 else "") +
+                       r". This type is used " + (r"once" if len(b["layers"]) == 1 else f"{len(b['layers'])} times") + ".")
+            tex.append(r"\end{definition}")
+
+    head = (r"W_E^{\top}" if tied else r"W_{\mathrm{LM}}") + r"\,\op{RMSNorm}_{\mathrm{final}}(h)_t"
+    tex.append(r"\begin{definition}[Output head]")
+    tex.append(r"$\Psi:\mathbb{R}^{T\times d}\to\mathbb{R}^{T\times V}$ normalises the last hidden state and scores every "
+               r"vocabulary token" + (r", re-using the embedding matrix (tied weights)" if tied else
+                                      r" with its own matrix $W_{\mathrm{LM}}\in\mathbb{R}^{V\times d}$") + ":")
+    tex.append(r"\begin{equation}")
+    if softcap:
+        tex.append(r"  \Psi(h)_t = " + str(softcap) + r"\cdot\tanh\!\big(" + head + "/" + str(softcap) + r"\big)")
+    else:
+        tex.append(r"  \Psi(h)_t = " + head)
+    tex.append(r"\end{equation}")
+    if softcap:
+        tex.append(r"The $\tanh$ soft-cap keeps every logit in $(-" + str(softcap) + "," + str(softcap) + ")$.")
+    tex.append(r"\end{definition}")
+
+    # 2.3 neurons and heads ------------------------------------------------------
+    tex.append(r"\subsection{Neurons and attention heads}")
+    act = f0["act"]
+    ffn_blocks = [b for b in tblocks if b["f"]["ffn"]]
+    if ffn_blocks and ffn_blocks[0]["f"]["ffn"] == "moe":
+        fb = ffn_blocks[0]["f"]
+        Ntot = sum(len(b["layers"]) * b["f"]["E"] * b["f"]["dff"] for b in ffn_blocks)
+        Nact = sum(len(b["layers"]) * b["f"]["topk"] * b["f"]["dff"] for b in ffn_blocks)
+        tex.append(r"\begin{definition}[Neuron, pre-activation value and state]")
+        tex.append(r"Each block has $E=" + str(fb["E"]) + r"$ experts, each with $d_{ff}=" + str(fb["dff"]) + r"$ neurons. "
+                   r"Neuron $j$ of expert $e$ in layer $\ell$ is the scalar function of a normalised token vector $u\in\mathbb{R}^{d}$")
+        tex.append(r"\begin{equation}")
+        tex.append(r"  \eta^{(\ell)}_{e,j}(u) = (c_j+1)\,a_j\,\sigma(1.702\,a_j),\qquad a_j = W^{g,(\ell)}_{e,j}\cdot u + b^{g}_{e,j},\quad c_j = W^{u,(\ell)}_{e,j}\cdot u + b^{u}_{e,j},")
+        tex.append(r"\end{equation}")
+        tex.append(r"where $W^{g}_{e,j}$, $W^{u}_{e,j}$ are the gate and up rows of $W^{gu}_e$. An expert's output is "
+                   r"$\op{E}_e(u)=\sum_j \eta_{e,j}(u)\,W^{d}_{e}[:,j]+b^{d}_e$. The network has $N=" + mnum(Ntot) +
+                   r"$ expert neurons, of which only $" + mnum(Nact) + r"$ (the top-" + str(fb["topk"]) +
+                   r" experts in every layer) are evaluated for a given token. For input $x$ at position $t$:")
+        pre = r"a_j"
+    elif ffn_blocks:
+        Ntot = sum(len(b["layers"]) * b["f"]["dff"] for b in ffn_blocks)
+        dffs = valset(b["f"]["dff"] for b in ffn_blocks)
+        tex.append(r"\begin{definition}[Neuron, pre-activation value and state]")
+        tex.append(r"The feed-forward sub-layer of block $\ell$ contains $d_{ff}^{(\ell)}" + ("=" if "{" not in dffs else r"\in") + dffs +
+                   r"$ neurons. Neuron $j$ of layer $\ell$ is the scalar function of a normalised token vector $u\in\mathbb{R}^{d}$")
+        tex.append(r"\begin{equation}")
+        tex.append(r"  \eta^{(\ell)}_j(u) = " + act + r"\big(W^{(\ell)}_{\mathrm{gate},j}\cdot u\big)\;\big(W^{(\ell)}_{\mathrm{up},j}\cdot u\big),")
+        tex.append(r"\end{equation}")
+        tex.append(r"where $W_{\mathrm{gate},j}$ is the $j$-th row of $W_{\mathrm{gate}}$. The feed-forward output is the "
+                   r"sum of the neuron outputs, each written along its own column of $W_{\mathrm{down}}$:")
+        tex.append(r"\begin{equation}")
+        tex.append(r"  \op{FFN}_\ell(u) = \sum_{j=1}^{d_{ff}^{(\ell)}} \eta^{(\ell)}_j(u)\;W^{(\ell)}_{\mathrm{down}}[:,j].")
+        tex.append(r"\end{equation}")
+        tex.append(r"Across its $L$ blocks the network has $N=\sum_{\ell=1}^{L} d_{ff}^{(\ell)}=" + mnum(Ntot) +
+                   r"$ feed-forward neurons. For input $x$ at position $t$, with $u^{(\ell)}_t(x)$ the normalised input of the feed-forward sub-layer:")
+        pre = r"W^{(\ell)}_{\mathrm{gate},j}\cdot u^{(\ell)}_t(x)"
+    if ffn_blocks:
+        tex.append(r"\begin{itemize}")
+        tex.append(r"\item $\mathcal{V}(\eta;x,t)=" + pre + r"\in\mathbb{R}$ is the \textbf{pre-activation value} of neuron $\eta$ (the argument of the non-linearity).")
+        tex.append(r"\item $\mathcal{S}(\eta;x,t)$ is its \textbf{activation state}: \emph{active} if $\mathcal{V}>0$ and "
+                   r"\emph{inactive} if $\mathcal{V}\le 0$. The non-linearity is smooth, unlike ReLU, so an inactive neuron's "
+                   r"output is strongly suppressed rather than exactly zero.")
+        tex.append(r"\end{itemize}")
+        tex.append(r"\end{definition}")
+
+    attn_blocks = [b for b in tblocks if b["f"]["mixer"] == "attn"]
+    if attn_blocks:
+        nat = sum(len(b["layers"]) for b in attn_blocks)
+        fa = attn_blocks[0]["f"]
+        gated = any(b["f"].get("gated") for b in attn_blocks)
+        tex.append(r"\begin{definition}[Attention head and attention pattern]")
+        tex.append(r"Head $h$ of an attention layer $\ell$ reads from the whole sequence through its attention pattern "
+                   r"$P^{(\ell)}_h(x)\in\mathbb{R}^{T\times T}$ (row $t$ = how much position $t$ attends to each earlier position) "
+                   r"and writes through its own $d\times d_h$ slice $W^{(\ell)}_{O,h}$ of $W_O$:")
+        tex.append(r"\begin{equation}")
+        tex.append(r"  \op{Attn}_\ell(u) = \sum_{h=1}^{H} " + (r"\big(P^{(\ell)}_h V_{g(h)}\odot\sigma(G_h)\big)" if gated else r"P^{(\ell)}_h\,V_{g(h)}") +
+                   r"\,W^{(\ell)\top}_{O,h}" + (r" + b_O" if fa["o_bias"] else "") + ".")
+        tex.append(r"\end{equation}")
+        tex.append(r"$g(h)$ is the key/value head shared by query head $h$ (grouped-query attention). The pattern $P_h$ plays the "
+                   r"role that the activation state plays for neurons: once $P_h$ is fixed, the head is linear in its values. "
+                   r"The network has " + str(nat) + r" attention layers $\times$ $H=" + str(fa["H"]) + r"$ heads $=" +
+                   str(nat * fa["H"]) + r"$ attention heads.")
+        tex.append(r"\end{definition}")
+
+    # 2.4 architecture and parameters ---------------------------------------------
+    tex.append(r"\subsection{Architecture and parameters}")
+    arch = [("V", Vs), ("d", str(d)), ("L", str(L)), ("c", "(" + pattern_str(text_stack["groups"]) + ")")]
+    if attn_blocks:
+        arch += [("H", valset(b["f"]["H"] for b in attn_blocks)), ("H_{kv}", valset(b["f"]["Hkv"] for b in attn_blocks)),
+                 ("d_h", valset(b["f"]["dh"] for b in attn_blocks))]
+    if ffn_blocks:
+        arch.append(("d_{ff}", valset(b["f"]["dff"] for b in ffn_blocks)))
+        if ffn_blocks[0]["f"]["ffn"] == "moe":
+            arch += [("E", str(ffn_blocks[0]["f"]["E"])), ("k", str(ffn_blocks[0]["f"]["topk"]))]
+    tex.append(r"\begin{definition}[Architecture and parameters]")
+    tex.append(r"The \textbf{architecture} is the tuple of sizes and the layer-type sequence:")
+    tex.append(r"\begin{equation}")
+    tex.append(r"  \mathcal{A} = (" + ",".join(a for a, _ in arch) + r") = (" + ",\\ ".join(v for _, v in arch) + ").")
+    tex.append(r"\end{equation}")
+    rest_names = [r"W_E"] + [r"\theta_1,\dots,\theta_L", r"\gamma_{\mathrm{final}}"] + ([] if tied else [r"W_{\mathrm{LM}}"])
+    rest_names += [r"\theta_{\op{" + ("Enc_V" if s["role"] == "vision" else "Enc_A") + "}}" for s in towers]
+    if towers:
+        rest_names.append(r"\theta_{\op{Proj}}")
+    if has_ple:
+        rest_names.append(r"\theta_{\mathrm{PLE}}")
+    tex.append(r"The \textbf{parameters} are $\theta=\{" + ",\\ ".join(rest_names) + r"\}$" +
+               (r" ($W_E$ is shared with the output head)" if tied else "") + r". Grouping the blocks by type,")
+    stack_total = sum(b["params"] * len(b["layers"]) for s in stacks for b in s["blocks"])
+    terms = [f"{len(b['layers'])}\\times{mnum(b['params'])}" for s in stacks for b in s["blocks"]]
+    terms.append(mnum(total - stack_total))
+    tex.append(r"\begin{align*}")
+    tex.append(r"  |\theta| &= \sum_{\text{types } c} n_c\,|\theta_c| + |\theta_{\mathrm{rest}}| \\")
+    for i in range(0, len(terms), 3):
+        tex.append(r"  &" + ("=" if i == 0 else r"\quad+") + " " + " + ".join(terms[i:i + 3]) + r" \\")
+    tex.append(r"  &= " + mnum(total) + ",")
+    tex.append(r"\end{align*}")
+    tex.append(r"where $n_c$ is how often type $c$ occurs and $\theta_{\mathrm{rest}}$ holds everything outside the repeated "
+               r"stacks (embedding, final norm, " + ("encoder stems and projector, " if towers else "") +
+               r"\dots; Table~\ref{tab:nonrep}).")
+    tex.append(r"\end{definition}")
+
+    # 2.5 outputs --------------------------------------------------------------------
+    tex.append(r"\subsection{Output representations}")
+    tex.append(r"\begin{definition}[Output representations]")
+    tex.append(r"For an input sequence $x$, the output can be read at three levels:")
+    tex.append(r"\begin{enumerate}")
+    tex.append(r"\item \textbf{Logits:} $y=f_\theta(x)\in\mathbb{R}^{T\times V}$, one score per vocabulary token at every position.")
+    tex.append(r"\item \textbf{Next-token distribution:} $p(x)_{t,k}=\dfrac{\exp(y_{t,k})}{\sum_{j=1}^{V}\exp(y_{t,j})}"
+               r"=\Pr\big(x_{t+1}=k\mid x_{1},\dots,x_{t}\big)$.")
+    tex.append(r"\item \textbf{Predicted next token:} $z(x)=\operatorname{argmax}_{k\in\{1,\dots,V\}} y_{T,k}$ (greedy decoding). "
+               r"Generation appends $z(x)$ (or a sample from $p(x)_{T}$) to $x$ and applies $f_\theta$ again; in practice "
+               r"the keys and values of earlier positions are cached.")
+    tex.append(r"\end{enumerate}")
+    tex.append(r"The model is \textbf{causal}: $y_t$ depends only on $x_1,\dots,x_t$, because every attention mask hides "
+               r"later positions" + (r" (sliding-window layers additionally hide positions more than $w$ tokens back)"
+                                     if any(b["f"]["sliding"] for b in tblocks) else "") +
+               r". Training minimises the cross-entropy $-\sum_{t}\log p(x)_{t,x_{t+1}}$.")
+    tex.append(r"\end{definition}")
+
+    # 2.6 intermediate states -------------------------------------------------------
+    tex.append(r"\subsection{Intermediate states and sub-network decomposition}")
+    tex.append(r"To study what happens at one layer $\ell\in\{1,\dots,L\}$, split the composition into a prefix, the "
+               r"layer itself and a suffix:")
+    tex.append(r"\begin{equation}")
+    tex.append(r"  f_\theta = \underbrace{\Psi\circ\mathcal{B}^{(L)}\circ\cdots\circ\mathcal{B}^{(\ell+1)}}_{G_{\ell+1}\ \text{(suffix)}}"
+               r"\circ\underbrace{\mathcal{B}^{(\ell)}}_{\text{layer }\ell}\circ"
+               r"\underbrace{\mathcal{B}^{(\ell-1)}\circ\cdots\circ\mathcal{B}^{(1)}\circ " + inp + r"}_{F_{\ell-1}\ \text{(prefix)}}")
+    tex.append(r"\end{equation}")
+    M = r"\op{Mixer}" if f0["mixer"] == "gdn" else r"\op{Attn}"
+    Nn = r"\op{RMSNorm}"
+    if f0["sandwich"]:
+        a_def = Nn + r"_{\mathrm{pa}}\big(" + M + r"_\ell(" + Nn + r"_{\mathrm{in}}(h^{(\ell-1)}))\big)"
+        u_def = Nn + r"_{\mathrm{pre}}(\hat h^{(\ell)})"
+        m_def = Nn + r"_{\mathrm{pf}}\big(\op{FFN}_\ell(u^{(\ell)})\big)"
+    else:
+        a_def = M + r"_\ell\big(" + Nn + r"_{1}(h^{(\ell-1)})\big)"
+        u_def = Nn + r"_{2}(\hat h^{(\ell)})"
+        m_def = r"\op{FFN}_\ell(u^{(\ell)})"
+    tex.append(r"\begin{itemize}")
+    tex.append(r"\item \textbf{Prefix} $F_{\ell-1}:\mathcal{X}\to\mathbb{R}^{T\times d}$ maps the tokens to the hidden state "
+               r"entering layer $\ell$ ($F_0=" + inp + r"$).")
+    tex.append(r"\item \textbf{Hidden state} (residual stream) after layer $\ell$: $h^{(\ell)}=F_\ell(x)=\mathcal{B}^{(\ell)}(h^{(\ell-1)}" + ple_arg + r")\in\mathbb{R}^{T\times d}$, with $h^{(0)}=" + inp + r"(x)$.")
+    tex.append(r"\item \textbf{Inside layer $\ell$:} the attention write $a^{(\ell)}=" + a_def + r"$, the mid-block state "
+               r"$\hat h^{(\ell)}=h^{(\ell-1)}+a^{(\ell)}$, the feed-forward input $u^{(\ell)}=" + u_def + r"$, the "
+               r"pre-activations $\hat x^{(\ell)}=u^{(\ell)}W^{(\ell)\top}_{\mathrm{gate}}\in\mathbb{R}^{T\times d_{ff}}$ and the "
+               r"neuron outputs $\eta^{(\ell)}(u^{(\ell)})\in\mathbb{R}^{T\times d_{ff}}$, and the feed-forward write "
+               r"$m^{(\ell)}=" + m_def + r"$." if f0["ffn"] == "gated" else
+               r"\item \textbf{Inside layer $\ell$:} the attention write $a^{(\ell)}=" + a_def + r"$, the mid-block state "
+               r"$\hat h^{(\ell)}=h^{(\ell-1)}+a^{(\ell)}$, the feed-forward input $u^{(\ell)}=" + u_def + r"$ and the "
+               r"feed-forward write $m^{(\ell)}=" + m_def + r"$.")
+    tex.append(r"\item \textbf{Suffix} $G_{\ell+1}:\mathbb{R}^{T\times d}\to\mathbb{R}^{T\times V}$ maps $h^{(\ell)}$ to the "
+               r"logits ($G_{L+1}=\Psi$).")
+    tex.append(r"\end{itemize}")
+    tex.append(r"\paragraph{Residual stream.} Because every sub-layer only \emph{adds} to the hidden state, unrolling the "
+               r"composition gives the final hidden state as the embedding plus everything the layers wrote:")
+    tex.append(r"\begin{equation}")
+    extra = r"+c^{(\ell)}" if has_ple else ""
+    if f0["layer_scalar"]:
+        tex.append(r"  h^{(L)} = \Big(\prod_{k=1}^{L}\gamma_k\Big)\,h^{(0)} + \sum_{\ell=1}^{L}\Big(\prod_{k=\ell}^{L}\gamma_k\Big)"
+                   r"\big(a^{(\ell)}+m^{(\ell)}" + extra + r"\big)")
+    else:
+        tex.append(r"  h^{(L)} = h^{(0)} + \sum_{\ell=1}^{L}\big(a^{(\ell)}+m^{(\ell)}" + extra + r"\big)")
+    tex.append(r"\end{equation}")
+    if has_ple:
+        tex.append(r"with $c^{(\ell)}=\op{PLE}_\ell(\hat h^{(\ell)}+m^{(\ell)})$ the per-layer-embedding write.")
+    if f0["layer_scalar"]:
+        tex.append(r"The fixed scalars $\gamma_\ell$ rescale everything written so far, so earlier writes are multiplied by all later scalars.")
+    tex.append(r"So $f_\theta(x)=\Psi(h^{(L)})$: each layer reads the current stream and adds a correction to it.")
+
+    # 2.7 local linear --------------------------------------------------------------
+    tex.append(r"\subsection{Local linear representation}")
+    tex.append(r"A ReLU network is piecewise affine: inside a polytope cell it collapses to one matrix. This model is not, because "
+               r"softmax, $" + act + r"$ and the normalisations are smooth. Its local behaviour is described by the first-order "
+               r"(Jacobian) linearisation instead. Tokens are discrete, so we perturb the embedded input $h^{(0)}$.")
+    tex.append(r"\begin{definition}[Local linear response]")
+    tex.append(r"Let $J_\ell=D\mathcal{B}^{(\ell)}(h^{(\ell-1)})$ be the Jacobian of block $\ell$ at the current hidden state "
+               r"(tensors flattened to vectors). The chain rule applied to the residual sub-layers $(\mathrm{id}+g_{\ell,i})$ gives")
+    nb = len(block_composition(f0)[1])
+    prod = r"\cdots".join(f"(I+Dg_{{\\ell,{i}}})" for i in range(nb, 0, -1)) if nb <= 3 else r"\prod_{i}(I+Dg_{\ell,i})"
+    tex.append(r"\begin{equation}")
+    tex.append(r"  J_\ell = " + (r"\gamma_\ell\," if f0["layer_scalar"] else "") + prod.replace(r")\cdots(", r")(") + r",")
+    tex.append(r"\end{equation}")
+    tex.append(r"where $g_{\ell,1}$ is the attention branch, $g_{\ell,2}$ the feed-forward branch" +
+               (r", $g_{\ell,3}$ the PLE branch" if has_ple else "") + r" and each $Dg$ is taken at that branch's input. "
+               r"For a small perturbation $\delta$ of $h^{(0)}$, the response of the network decomposed around layer $\ell$ is")
+    tex.append(r"\begin{equation}")
+    tex.append(r"  f_\theta(h^{(0)}+\delta)-f_\theta(h^{(0)}) \approx G^{(\ell+1)}_x\cdot J_\ell\cdot F^{(\ell-1)}_x\cdot\delta,")
+    tex.append(r"\end{equation}")
+    tex.append(r"with $F^{(\ell-1)}_x=J_{\ell-1}\cdots J_1$ (prefix) and $G^{(\ell+1)}_x=J_\Psi\,J_L\cdots J_{\ell+1}$ (suffix). "
+               r"Multiplying out the products of $(I+Dg)$ terms writes $J_\Psi J_L\cdots J_1$ as a sum over \emph{paths}: the "
+               r"identity path straight from embedding to head, plus one term for every subset of sub-layers a signal passes through.")
+    tex.append(r"\end{definition}")
+
+    # 2.8 notation -------------------------------------------------------------------
+    tex.append(r"\subsection{Summary of notation}")
+    rows = [r"$f_\theta:\mathcal{X}\to\mathcal{Y}$ & the whole model, $\{1..V\}^T\to\mathbb{R}^{T\times V}$",
+            r"$" + inp + r",\ \Psi$ & embedding and output head",
+            r"$\mathcal{B}^{(\ell)},\ \theta_\ell$ & block $\ell$ and its parameters, $\ell=1,\dots,L$",
+            r"$\mathcal{B}_c,\ c(\ell)$ & block type $c$; type of layer $\ell$",
+            r"$\mathcal{B}^{\circ n}$ & $n$ consecutive blocks of one type (each with its own weights)",
+            r"$(\mathrm{id}+g)$ & residual sub-layer $h\mapsto h+g(h)$",
+            r"$h^{(\ell)}$ & hidden state (residual stream) after layer $\ell$; $h^{(0)}$ = embeddings",
+            r"$a^{(\ell)},\ m^{(\ell)}$ & what the attention / feed-forward sub-layer of layer $\ell$ adds to the stream",
+            r"$\eta^{(\ell)}_j$ & $j$-th feed-forward neuron of layer $\ell$",
+            r"$\mathcal{V}(\eta;x,t),\ \mathcal{S}(\eta;x,t)$ & pre-activation value and active/inactive state of a neuron",
+            r"$P^{(\ell)}_h$ & attention pattern of head $h$ in layer $\ell$ ($T\times T$)",
+            r"$F_{\ell-1},\ G_{\ell+1}$ & prefix (embedding to layer $\ell-1$) and suffix (layer $\ell+1$ to logits)",
+            r"$J_\ell,\ F^{(\ell-1)}_x,\ G^{(\ell+1)}_x$ & Jacobian of block $\ell$, and of the prefix / suffix at input $x$",
+            r"$p(x),\ z(x)$ & next-token distribution and greedy next-token prediction"]
+    if has_ple:
+        rows.insert(3, r"$p_\ell$ & per-layer embedding fed to block $\ell$")
+    if towers:
+        rows.insert(2, r"$\op{Enc_V},\ \op{Enc_A},\ \op{Proj}$ & vision / audio encoders and their projectors into the text width")
+    tex += table(r"l>{\raggedright\arraybackslash}p{10.5cm}", r"Symbol & Meaning", rows)
+    return tex
+
+
+def layer_loops(groups, names, ple=False):
+    """Pseudocode loops over a stack; layers are numbered l = 1..n as in the math section."""
+    out = []
+    arg = r"h,\,p_\ell" if ple else "h"
+    call = lambda c: r"h \gets " + B(c) + "(" + arg + r";\,\theta_\ell)"
+    for unit, k, start in groups:
+        rs = runs(unit)
+        lo, hi = start + 1, start + len(unit) * k
+        if len(rs) == 1:
+            c, n_ = rs[0]
+            if n_ * k > 1:
+                out.append(r"\For{$\ell \gets " + str(lo) + r"$ \textbf{to} $" + str(hi) + r"$} \Comment{" +
+                           f"{n_ * k} blocks of type ${B(c)}$" + "}")
+                out.append(r"\State $" + call(c) + r"$ \Comment{" + names[c] + r"; result is $h^{(\ell)}$}")
+                out.append(r"\EndFor")
+            else:
+                out.append(r"\State $\ell \gets " + str(lo) + r";\ " + call(c) + r"$ \Comment{" + names[c] + "}")
+            continue
+        out.append(r"\State $\ell \gets " + str(lo - 1) + "$")
+        if k > 1:
+            out.append(r"\For{$r \gets 1$ \textbf{to} $" + str(k) + r"$} \Comment{layers " +
+                       f"{lo}--{hi}: pattern of {len(unit)} blocks, repeated {k} times" + "}")
+        for c, n_ in rs:
+            step = r"\State $\ell \gets \ell+1;\ " + call(c) + r"$ \Comment{" + names[c] + "}"
+            if n_ > 1:
+                out.append(r"\For{$j \gets 1$ \textbf{to} $" + str(n_) + r"$}")
+                out += [step, r"\EndFor"]
+            else:
+                out.append(step)
+        if k > 1:
+            out.append(r"\EndFor")
+    return out
 
 
 def generate_tex(model_name, model_path, model, config, cls, recs, types, variants=()):
@@ -936,15 +1466,17 @@ def generate_tex(model_name, model_path, model, config, cls, recs, types, varian
                    r" (same class, every tensor name and shape identical, checked when this document was generated). "
                    r"Fine-tuning changes only the weight values, so everything in this document applies to it unchanged. "
                    r"The two configs differ only in generation settings such as \texttt{eos\_token\_id}.")
-    tex.append(r"\paragraph{How to read this document.} Section~\ref{sec:func} writes the whole network as one "
-               r"composed function. Section~\ref{sec:algo} gives readable pseudocode for the forward pass and for every "
+    tex.append(r"\paragraph{How to read this document.} Section~\ref{sec:func} treats the model mathematically, top-down: "
+               r"first the whole network as one composition $\Psi\circ\mathcal{B}^{(L)}\circ\cdots\circ\mathcal{B}^{(1)}\circ E$ "
+               r"of layers, then a definition of every layer down to single neurons and attention heads, then parameters, "
+               r"outputs, intermediate states and the local linear response. Section~\ref{sec:algo} gives readable pseudocode for the forward pass and for every "
                r"distinct block type. Section~\ref{sec:compact} lists the weights of each block type \emph{once}, with "
                r"how many times it repeats. Section~\ref{sec:gloss} explains in plain language what every kind of layer "
                r"does. The original layer-by-layer table with every repetition written out is in "
                r"Appendix~\ref{app:full}.")
 
     # Notation ----------------------------------------------------------------
-    tex.append(r"\subsection*{Notation}")
+    tex.append(r"\subsection*{Basic notation}")
     tex.append(r"\begin{tabular}{ll}")
     tex.append(r"\toprule")
     tex.append(r"$B$, $T$ & batch size, sequence length (tokens) \\")
@@ -961,76 +1493,9 @@ def generate_tex(model_name, model_path, model, config, cls, recs, types, varian
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
 
-    # 2. Functional representation -----------------------------------------------
-    tex.append(r"\section{The Model as a Function}\label{sec:func}")
+    # 2. Mathematical representation -------------------------------------------------
     if text_stack:
-        L = text_stack["n"]
-        tex.append(f"Input: token ids $x \\in \\{{0,\\dots,V{{-}}1\\}}^{{B\\times T}}$. Output: next-token logits "
-                   f"$y \\in \\mathbb{{R}}^{{B\\times T\\times V}}$. The {L} decoder layers are written with "
-                   r"composition powers, so a block that repeats $n$ times appears once as $\mathcal{B}^{\circ n}$.")
-        tex.append(r"\begin{align*}")
-        emb = r"\op{Embed}(x)" + (r"\cdot\sqrt{d}" if gemma_scale else "")
-        if towers:
-            merge = [emb]
-            for s in towers:
-                tag = "img" if s["role"] == "vision" else "aud"
-                enc = "Enc_V" if s["role"] == "vision" else "Enc_A"
-                merge.append(r"\op{Proj}_{\mathrm{" + tag + r"}}\big(\op{" + enc + r"}(\mathrm{" + tag + r"})\big)")
-            tex.append(r"  h_0 &= \op{Merge}\Big(" + r",\ ".join(merge) + r"\Big) \\")
-        else:
-            tex.append(r"  h_0 &= " + emb + r" \\")
-        if has_ple:
-            tex.append(r"  p &= \tfrac{1}{\sqrt2}\Big(\op{Embed}_{\mathrm{PLE}}(x) + \op{RMSNorm}\big(W_{\mathrm{ple}}\,h_0/\sqrt{d}\big)\Big),"
-                       r"\quad p=(p_0,\dots,p_{L-1}) \\")
-        tex.append(r"  h_L &= \Big(" + stack_expr(text_stack["groups"]) + r"\Big)(h_0) \\")
-        logits = (r"W_{E}^{\top}" if tied else r"W_{\mathrm{LM}}") + r"\,\op{RMSNorm}_{\mathrm{final}}(h_L)"
-        if softcap:
-            tex.append(r"  z &= " + logits + r" \\")
-            tex.append(f"  y &= {softcap}\\cdot\\tanh(z/{softcap})")
-        else:
-            tex.append(r"  y &= " + logits)
-        tex.append(r"\end{align*}")
-        if towers:
-            tex.append(r"$\op{Merge}$ puts the projected image/audio vectors at the placeholder-token positions of the text "
-                       r"embedding sequence. The encoders are themselves repeated stacks:")
-            tex.append(r"\begin{align*}")
-            for i, s in enumerate(towers):
-                enc = "Enc_V" if s["role"] == "vision" else "Enc_A"
-                pre = "PatchEmbed" if s["role"] == "vision" else "Subsample"
-                post = "Post"
-                end = r" \\" if i < len(towers) - 1 else ""
-                tex.append(r"  \op{" + enc + r"} &= \op{" + post + r"}\circ " + stack_expr(s["groups"]) +
-                           r"\circ \op{" + pre + "}" + end)
-            tex.append(r"\end{align*}")
-        if has_ple:
-            tex.append(r"Each decoder layer $\ell$ also receives its own per-layer embedding $p_\ell$ "
-                       r"(written $\mathcal{B}(h)$ for brevity; strictly $\mathcal{B}(h, p_\ell)$).")
-        tex.append(r"\subsection{Layer pattern}")
-        rows = []
-        for s in stacks:
-            for b in s["blocks"]:
-                rows.append(f"${B(b['code'])}$ & {esc(b['name'])} & {len(b['layers'])} & {fmt(b['params'])} & "
-                            f"{ranges_text(b['layers'])}")
-        tex += table(r"l>{\raggedright\arraybackslash}p{5.6cm}rr>{\raggedright\arraybackslash}p{4.4cm}",
-                     r"Symbol & Block type & Count & Params / block & Layer indices", rows)
-        for s in stacks:
-            tex.append(r"\paragraph{" + ROLE_TITLE[s["role"]] + f" ({s['n']} layers).}} ")
-            parts = []
-            for unit, k, start in s["groups"]:
-                u = ", ".join(f"${B(c)}$" + (f"$\\times{r}$" if r > 1 else "") for c, r in runs(unit))
-                parts.append(f"layers {start}--{start + len(unit) * k - 1}: [{u}] repeated {k}$\\times$"
-                             if k > 1 else f"layers {start}--{start + len(unit) - 1}: [{u}]")
-            tex.append("; ".join(parts) + ".")
-
-        tex.append(r"\subsection{Block functions}")
-        for s in stacks:
-            for b in s["blocks"]:
-                f = b["f"]
-                tex.append(r"\paragraph{$" + B(b["code"]) + r"$ --- " + esc(b["name"]) + ".}")
-                lines = wiring_lines(f)
-                if not f["conformer"]:
-                    lines += mixer_lines(f) + ffn_lines(f)
-                tex += align(lines)
+        tex += math_section(name_tex, stacks, text_stack, towers, d, V, tied, softcap, has_ple, gemma_scale, total)
 
     # 3. Pseudocode ---------------------------------------------------------------
     tex.append(r"\section{Forward Pass in Pseudocode}\label{sec:algo}")
@@ -1039,8 +1504,8 @@ def generate_tex(model_name, model_path, model, config, cls, recs, types, varian
         tex.append(r"\caption{" + name_tex + r": full forward pass}")
         tex.append(r"\begin{algorithmic}[1]")
         tex.append(r"\Require token ids $x$ of shape $B\times T$" + (r"; optional images / audio" if towers else ""))
-        tex.append(r"\State $h \gets \op{Embed}(x)" + (r"\cdot\sqrt{d}" if gemma_scale else "") +
-                   f"$ \\Comment{{look up one vector per token: $B{{\\times}}T{{\\times}}{d}$}}")
+        tex.append(r"\State $h \gets E(x)" + (r"\cdot\sqrt{d}" if gemma_scale else "") +
+                   f"$ \\Comment{{$h^{{(0)}}$: one vector per token, $B{{\\times}}T{{\\times}}{d}$}}")
         for s in towers:
             what = "image" if s["role"] == "vision" else "audio"
             enc = "Enc_V" if s["role"] == "vision" else "Enc_A"
@@ -1051,24 +1516,10 @@ def generate_tex(model_name, model_path, model, config, cls, recs, types, varian
             tex.append(r"\EndIf")
         if has_ple:
             tex.append(r"\State $p \gets \op{PerLayerInputs}(x, h)$ \Comment{" +
-                       f"{L} small vectors per token, one for each layer" + "}")
-        for unit, k, start in text_stack["groups"]:
-            end = start + len(unit) * k - 1
-            if k > 1:
-                tex.append(r"\For{$r \gets 0$ \textbf{to} $" + str(k - 1) + r"$} \Comment{layers " + f"{start}--{end}: pattern of {len(unit)} repeated {k} times" + "}")
-            pos = 0
-            for c, n_ in runs(unit):
-                arg = r"h, p_\ell" if has_ple else "h"
-                if n_ > 1:
-                    tex.append(r"\For{$j \gets 1$ \textbf{to} $" + str(n_) + r"$}")
-                    tex.append(r"\State $h \gets " + B(c) + "(" + arg + r")$ \Comment{" + esc(next(b["name"] for b in text_stack["blocks"] if b["code"] == c)) + "}")
-                    tex.append(r"\EndFor")
-                else:
-                    tex.append(r"\State $h \gets " + B(c) + "(" + arg + r")$ \Comment{" + esc(next(b["name"] for b in text_stack["blocks"] if b["code"] == c)) + "}")
-                pos += n_
-            if k > 1:
-                tex.append(r"\EndFor")
-        tex.append(r"\State $h \gets \op{RMSNorm}_{\mathrm{final}}(h)$")
+                       f"{text_stack['n']} small vectors per token, one for each layer" + "}")
+        names = {b["code"]: esc(b["name"]) for b in text_stack["blocks"]}
+        tex += layer_loops(text_stack["groups"], names, ple=has_ple)
+        tex.append(r"\State $h \gets \op{RMSNorm}_{\mathrm{final}}(h)$ \Comment{$h=h^{(L)}$; this and the next step are $\Psi$}")
         tex.append(r"\State $y \gets h\," + (r"W_E^{\top}" if tied else r"W_{\mathrm{LM}}^{\top}") +
                    f"$ \\Comment{{logits $B{{\\times}}T{{\\times}}{fmt(V) if isinstance(V, int) else V}$" +
                    (", embedding matrix re-used" if tied else "") + "}")
@@ -1086,11 +1537,7 @@ def generate_tex(model_name, model_path, model, config, cls, recs, types, varian
             tex.append(r"\State $h \gets \op{PatchEmbed}(\text{pixels}) + \text{position embedding}$ \Comment{one vector per image patch}")
         else:
             tex.append(r"\State $h \gets \op{Subsample}(\text{mel spectrogram})$ \Comment{2 strided convs: 4$\times$ fewer frames}")
-        for unit, k, start in s["groups"]:
-            for c, n_ in runs(unit):
-                tex.append(r"\For{$\ell \gets " + str(start) + r"$ \textbf{to} $" + str(start + n_ * k - 1) + r"$}")
-                tex.append(r"\State $h \gets " + B(c) + r"(h)$")
-                tex.append(r"\EndFor")
+        tex += layer_loops(s["groups"], {b["code"]: esc(b["name"]) for b in s["blocks"]})
         tex.append(r"\State $h \gets \op{Post}(h)$ \Comment{final norm / pooling / merging, see Table~\ref{tab:nonrep}}")
         tex.append(r"\State \Return $h$")
         tex.append(r"\end{algorithmic}")

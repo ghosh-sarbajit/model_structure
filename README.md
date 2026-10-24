@@ -70,10 +70,19 @@ tex_output/
 ## What Each `.tex` / `.pdf` Contains
 
 1. **Model Overview**: parameter count, dtype, key hyperparameters (and vision/audio tower sizes).
-2. **The Model as a Function**: the network as one composed function, e.g.
-   `y = W_E^T RMSNorm((B_F ∘ B_L^{∘3})^{∘6}(Embed(x)))`. Repeated layers appear as loops/powers.
-   Also a layer-pattern table and equations for every distinct block type.
+2. **Mathematical Representation** (top-down, in the style of the formal DNN definition
+   `f = f_{r+1} ∘ σ ∘ f_r ∘ … ∘ σ ∘ f_1`):
+   - the model as a composition `f_θ = Ψ ∘ B^{(L)} ∘ … ∘ B^{(1)} ∘ E`, then with block types and composition powers,
+     e.g. `Ψ ∘ ((B_F ∘ B_L^{∘3})^{∘6}) ∘ E`, plus the encoder towers and a layer-pattern table;
+   - a definition of every layer: embedding, norms, each block type as residual sub-layers `(id + g)` with its
+     equations and parameter shapes, and the output head;
+   - neurons (pre-activation value and active/inactive state) and attention heads (attention pattern);
+   - the architecture tuple and parameter set θ, with `|θ| = Σ n_c |θ_c| + |θ_rest|`;
+   - output representations (logits, next-token distribution, greedy prediction, causality);
+   - the prefix/suffix decomposition `f = G_{ℓ+1} ∘ B^{(ℓ)} ∘ F_{ℓ-1}` and the unrolled residual stream;
+   - the local linear (Jacobian) response, and a summary-of-notation table.
 3. **Forward Pass in Pseudocode**: commented pseudocode with tensor shapes, for the full model and for each block type.
+   The loops run over the layer index ℓ and call `B_c(h; θ_ℓ)`, matching Section 2.
 4. **Compact Architecture**: weights of each block type listed once, with repeat count. Includes checkpoint-only
    tensors that transformers never builds (e.g. the Qwen3.5 MTP head).
 5. **What Each Layer Does**: a plain-English description of every kind of layer (q_proj, gate_proj, …).
