@@ -31,6 +31,8 @@
 Model name & Llama-3.2-1B \\
 Transformers class & \texttt{LlamaForCausalLM} \\
 Path & \texttt{/models/memorization/Llama-3.\allowbreak{}2-1B} \\
+Same architecture as & Llama-3.2-1B-Instruct \\
+\quad its path & \texttt{/models/sayak\_da\_work/Llama-3.\allowbreak{}2-1B-Instruct} \\
 Total parameters & 1,235,814,400 (1.24B) \\
 Weight dtype & bfloat16 \\
 \midrule
@@ -49,6 +51,7 @@ RoPE base $\theta$ & 500,000 \\
 \bottomrule
 \end{tabular}
 
+\paragraph{Same structure.} Llama-3.2-1B-Instruct has exactly the same architecture as Llama-3.2-1B (same class, every tensor name and shape identical, checked when this document was generated). Fine-tuning changes only the weight values, so everything in this document applies to it unchanged. The two configs differ only in generation settings such as \texttt{eos\_token\_id}.
 \paragraph{How to read this document.} Section~\ref{sec:func} writes the whole network as one composed function. Section~\ref{sec:algo} gives readable pseudocode for the forward pass and for every distinct block type. Section~\ref{sec:compact} lists the weights of each block type \emph{once}, with how many times it repeats. Section~\ref{sec:gloss} explains in plain language what every kind of layer does. The original layer-by-layer table with every repetition written out is in Appendix~\ref{app:full}.
 \subsection*{Notation}
 \begin{tabular}{ll}

@@ -16,15 +16,20 @@ OUT_DIR = "/workspace/tex_output"
 # (/opt/dlami/nvme/sarbajit/local_models), mounted into the container.
 models_info = [
     ("Llama-3.2-1B", "/models/memorization/Llama-3.2-1B"),
+    ("Qwen3-0.6B", "/models/Qwen3-0.6B"),
     ("Qwen3.5-0.8B", "/models/memorization/Qwen3.5-0.8B"),
     ("gemma-4-E2B", "/models/memorization/gemma-4-E2B"),
     ("Llama-3.1-8B-Instruct", "/models/Llama-3.1-8B-Instruct"),
-    ("Llama-3.2-1B-Instruct", "/models/sayak_da_work/Llama-3.2-1B-Instruct"),
     ("Qwen2.5-0.5B-Instruct", "/models/sayak_da_work/Qwen2.5-0.5B-Instruct"),
     ("Qwen3.5-9B", "/models/sayak_da_work/Qwen3.5-9B"),
     ("gemma-3-12b-it", "/models/gemma-3-12b-it"),
     ("gpt-oss-20b", "/models/gpt-oss-20b"),
 ]
+# Fine-tuned variants whose architecture is identical to a model above. They get no PDF of their own;
+# the main model's PDF names them (after checking class, tensor names and shapes really match).
+same_arch = {
+    "Llama-3.2-1B": [("Llama-3.2-1B-Instruct", "/models/sayak_da_work/Llama-3.2-1B-Instruct")],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -860,7 +865,11 @@ def hyper_rows(config):
     return rows
 
 
-def generate_tex(model_name, model_path, model, config, cls, recs, types):
+def arch_signature(cls, recs):
+    return cls, [(r["path"], tuple(r["shape"]), r["dtype"], r["tied_to"]) for r in recs]
+
+
+def generate_tex(model_name, model_path, model, config, cls, recs, types, variants=()):
     total = sum(r["numel"] for r in recs if not r["tied_to"])
     text_cfg = config.get_text_config()
     stacks = [analyse_stack(model, config, s, recs, types) for s in find_stacks(model, types)]
@@ -898,6 +907,9 @@ def generate_tex(model_name, model_path, model, config, cls, recs, types):
     tex.append(f"Model name & {name_tex} \\\\")
     tex.append(f"Transformers class & {tt(cls)} \\\\")
     tex.append(f"Path & {tt(model_path)} \\\\")
+    for vname, vpath in variants:
+        tex.append(f"Same architecture as & {esc(vname)} \\\\")
+        tex.append(f"\\quad its path & {tt(vpath)} \\\\")
     tex.append(f"Total parameters & {fmt(total)} ({human(total)}) \\\\")
     if ckpt_extra:
         tex.append(f"Checkpoint-only tensors (not in total) & {fmt(sum(r['numel'] for r in ckpt_extra))} \\\\")
@@ -918,6 +930,12 @@ def generate_tex(model_name, model_path, model, config, cls, recs, types):
     tex.append(r"\bottomrule")
     tex.append(r"\end{tabular}")
     tex.append("")
+    if variants:
+        names = ", ".join(esc(v) for v, _ in variants)
+        tex.append(r"\paragraph{Same structure.} " + names + r" has exactly the same architecture as " + name_tex +
+                   r" (same class, every tensor name and shape identical, checked when this document was generated). "
+                   r"Fine-tuning changes only the weight values, so everything in this document applies to it unchanged. "
+                   r"The two configs differ only in generation settings such as \texttt{eos\_token\_id}.")
     tex.append(r"\paragraph{How to read this document.} Section~\ref{sec:func} writes the whole network as one "
                r"composed function. Section~\ref{sec:algo} gives readable pseudocode for the forward pass and for every "
                r"distinct block type. Section~\ref{sec:compact} lists the weights of each block type \emph{once}, with "
@@ -1203,7 +1221,16 @@ if __name__ == "__main__":
         try:
             model, config, cls = build_model(model_path)
             recs, types = collect_records(model)
-            generate_tex(model_name, model_path, model, config, cls, recs, types)
+            sig = arch_signature(cls, recs)
+            variants = []
+            for vname, vpath in same_arch.get(model_name, []):
+                vmodel, _, vcls = build_model(vpath)
+                if arch_signature(vcls, collect_records(vmodel)[0]) == sig:
+                    variants.append((vname, vpath))
+                    print(f"  {vname}: identical architecture, covered by this report")
+                else:
+                    print(f"  WARNING: {vname} differs from {model_name}; give it its own entry in models_info")
+            generate_tex(model_name, model_path, model, config, cls, recs, types, variants)
             del model
         except Exception as e:
             import traceback

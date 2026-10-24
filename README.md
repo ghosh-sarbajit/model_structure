@@ -83,4 +83,4 @@ tex_output/
 ## Notes
 
 - `--user "$(id -u):$(id -g)"` ensures output files are owned by you, not root
-- `Qwen3-0_6B.*` is from the old run; that model is no longer in `local_models`, so it is not regenerated
+- `Llama-3.2-1B-Instruct` has exactly the same architecture as `Llama-3.2-1B` (only weights and `eos_token_id` differ), so it has no separate PDF; `Llama-3_2-1B.pdf` names it. Fine-tuned variants like this are listed in `same_arch` in `generate_tex.py`, which checks every tensor name and shape still matches.
