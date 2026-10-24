@@ -11,6 +11,9 @@ Generate detailed LaTeX architecture diagrams for transformer models, then compi
 
 ## Order of Execution
 
+Every container must carry `--label owner=$(whoami)` (cluster rule: unlabelled containers are killed).
+Models are read from `/opt/dlami/nvme/sarbajit/local_models` (the `model` alias in `~/.bashrc`), mounted at `/models`.
+
 ### 1. Build the ML image
 ```bash
 docker build --label owner=$(whoami) --build-arg OWNER=$(whoami) \
@@ -18,10 +21,12 @@ docker build --label owner=$(whoami) --build-arg OWNER=$(whoami) \
 ```
 
 ### 2. Generate `.tex` files from all models
+No GPU needed: each model is built on the meta device from its `config.json` (no weights loaded).
+Pass model names (e.g. `python generate_tex.py gpt-oss-20b`) to generate only those.
 ```bash
-docker run --rm --gpus '"device=2"' \
+docker run --rm --label owner=$(whoami) \
     --user "$(id -u):$(id -g)" \
-    -v /opt/dlami/nvme/sarbajit/local_models:/models \
+    -v /opt/dlami/nvme/sarbajit/local_models:/models:ro \
     -v /opt/dlami/nvme/sarbajit/model_structure:/workspace \
     -w /workspace \
     sg_modelload \
@@ -29,24 +34,27 @@ docker run --rm --gpus '"device=2"' \
 ```
 Output: `tex_output/*.tex` (one per model)
 
-### 3. Build TeX Live image
+### 3. TeX Live image
+The existing `sg_tex` image already has `pdflatex`. To rebuild it:
 ```bash
 docker build --label owner=$(whoami) --build-arg OWNER=$(whoami) \
-    -t texlive-full -f Dockerfile.texlive .
+    -t sg_tex -f Dockerfile.texlive .
 ```
 
 ### 4. Compile `.tex` → `.pdf`
+Two passes so the table of contents and cross-references resolve.
 ```bash
-docker run --rm \
+docker run --rm --label owner=$(whoami) \
     --user "$(id -u):$(id -g)" \
     -v /opt/dlami/nvme/sarbajit/model_structure:/workdir \
     -w /workdir \
-    texlive-full \
-    sh -c 'mkdir -p tex_output/pdf && \
+    sg_tex \
+    sh -c 'mkdir -p tex_output/build tex_output/pdf && \
            for f in tex_output/*.tex; do \
-             pdflatex -interaction=nonstopmode -output-directory=tex_output "$f"; \
+             pdflatex -interaction=nonstopmode -output-directory=tex_output/build "$f" >/dev/null; \
+             pdflatex -interaction=nonstopmode -output-directory=tex_output/build "$f" >/dev/null; \
            done && \
-           mv tex_output/*.pdf tex_output/pdf/'
+           mv tex_output/build/*.pdf tex_output/pdf/ && rm -rf tex_output/build'
 ```
 Output: `tex_output/pdf/*.pdf`
 
@@ -61,13 +69,18 @@ tex_output/
 
 ## What Each `.tex` / `.pdf` Contains
 
-- **Model Overview** — total params, weight dtype
-- **Forward Pass Algorithm** — pseudocode with tensor shapes (`B × T × hidden`)
-- **Layer-by-Layer Table** — every weight tensor: path, type, shape, dtype, parameter count
-- **Parameter Count Estimation** — breakdown by component (Embedding, Attention, MLP, LayerNorm, LM Head)
+1. **Model Overview**: parameter count, dtype, key hyperparameters (and vision/audio tower sizes).
+2. **The Model as a Function**: the network as one composed function, e.g.
+   `y = W_E^T RMSNorm((B_F ∘ B_L^{∘3})^{∘6}(Embed(x)))`. Repeated layers appear as loops/powers.
+   Also a layer-pattern table and equations for every distinct block type.
+3. **Forward Pass in Pseudocode**: commented pseudocode with tensor shapes, for the full model and for each block type.
+4. **Compact Architecture**: weights of each block type listed once, with repeat count. Includes checkpoint-only
+   tensors that transformers never builds (e.g. the Qwen3.5 MTP head).
+5. **What Each Layer Does**: a plain-English description of every kind of layer (q_proj, gate_proj, …).
+6. **Parameter Count**: by component and by block type.
+7. **Appendix**: the original layer-by-layer table with every repetition, and per-layer parameter counts.
 
 ## Notes
 
 - `--user "$(id -u):$(id -g)"` ensures output files are owned by you, not root
-- `--gpus '"device=2"'` selects GPU 2; change the number for a different GPU
-- Models are loaded sequentially on GPU and fully analysed
+- `Qwen3-0_6B.*` is from the old run; that model is no longer in `local_models`, so it is not regenerated
